@@ -1,7 +1,8 @@
 # rawphp/laravel-capabilities
 
 > **Status:** core package in a **unit-complete monorepo design** — **not Packagist-published**, **0.x pre-stable** (no stable public API claim).  
-> Install today via monorepo **path** / VCS — see monorepo [docs/versioning.md](../../docs/versioning.md) and root [README readiness residuals](../../README.md#consumer-readiness-residuals).
+> Install today via monorepo **path** / VCS — see monorepo [docs/versioning.md](../../docs/versioning.md) and root [README readiness residuals](../../README.md#consumer-readiness-residuals).  
+> Closed in-monorepo: config-wired `makeRegistry`, durable `QueryTableGateway` path, release-prep metadata. **Packagist publish remains a human residual.**
 
 Core product capability bus for Laravel.
 
@@ -18,7 +19,9 @@ Define a capability once (schema, authorization, `run`, approval, audit) and exp
 | Troubleshooting | [docs/troubleshooting.md](../../docs/troubleshooting.md) |
 | First capability tutorial | [docs/tutorials/first-capability.md](../../docs/tutorials/first-capability.md) |
 
-**Getting started:** monorepo [First capability tutorial](../../docs/tutorials/first-capability.md) (path/VCS install, fluent + attribute define, registry invoke, HTTP, D-020). Full design: [docs/spec.md](../../docs/spec.md). D-020 helpers (`assertSchemaSnapshot`, `assertParity`) are **implemented for unit-path DX** (durable schema snapshots; multi-surface success/deny class parity with mocks/fakes) — not a live multi-surface HTTP/feature suite.
+**Getting started:** monorepo [First capability tutorial](../../docs/tutorials/first-capability.md) (path/VCS install, fluent + attribute define, durable stores / `QueryTableGateway`, registry invoke, HTTP, D-020). Full design: [docs/spec.md](../../docs/spec.md). D-020 helpers (`assertSchemaSnapshot`, `assertParity`) are **implemented for unit-path DX** (durable schema snapshots; multi-surface success/deny class parity with mocks/fakes) — not a live multi-surface HTTP/feature suite.
+
+**Registry boot:** `ContainerBindings::makeRegistry` is the production factory — it applies `config/capabilities.php` (surfaces, approval/idempotency drivers, audit, scope, rate limits, etc.) and injects the same store instances the service provider binds for accept/invoke parity. See root [Consumer readiness](../../README.md#consumer-readiness-residuals).
 
 ## Peer support / D-011 release gate
 
@@ -115,6 +118,43 @@ Consumer applications that install real peers can run an app-owned peer-live pat
 - [ ] `AdapterApi` bumped if bridge shapes changed
 - [ ] CHANGELOG / release notes list declared peer constraints
 - [ ] Default package CI still free of live peer installs
+
+---
+
+## Durable persistence (QueryTableGateway)
+
+Database-backed approval and idempotency stores use a first-party **`QueryTableGateway`** (`Rawphp\Capabilities\Persistence\QueryTableGateway`) implementing `TableGateway`. The package builds **one gateway per table** from an Illuminate `ConnectionInterface` — not a shared Eloquent model layer.
+
+| Driver config | Key | Default | Database path |
+|---|---|---|---|
+| Approval store | `approval.store` | `database` | `DatabaseApprovalStore` + `QueryTableGateway` on `capabilities_approvals` |
+| Approval connection | `approval.connection` | `null` (app default) | Optional named connection |
+| Idempotency | `idempotency.driver` | `memory` | Set `database` → `DatabaseIdempotencyStore` + gateway on `capabilities_idempotency` |
+| Idempotency connection | `idempotency.connection` | `null` | Optional named connection |
+
+```bash
+php artisan vendor:publish --tag=capabilities-config
+php artisan vendor:publish --tag=capabilities-migrations
+php artisan migrate
+```
+
+**Production default path:** leave `TableGateway` unbound; with `approval.store` / `idempotency.driver` = `database`, factories construct `QueryTableGateway` per table. Missing connection → boot/factory failure (no silent `ArrayTableGateway`).
+
+**Host override** (~10 lines) when you need a custom backend or in-memory isolation:
+
+```php
+// AppServiceProvider::register()
+use Rawphp\Capabilities\Persistence\ArrayTableGateway;
+use Rawphp\Capabilities\Persistence\TableGateway;
+
+$this->app->singleton(TableGateway::class, function () {
+    return new ArrayTableGateway; // or App\Persistence\CustomTableGateway
+});
+```
+
+A host-bound `TableGateway` is used for **both** database stores when present. Prefer unbound + dual QueryTableGateway in production. Integrator walkthrough: monorepo [first-capability tutorial](../../docs/tutorials/first-capability.md#durable-stores-approvals--idempotency).
+
+**Honesty:** this package is still **not Packagist-published** (path/VCS install only until a human completes the monorepo Packagist checklist). Durable gateway code is unit-tested with connection fakes; default package CI does not require a live MySQL/Postgres.
 
 ---
 
