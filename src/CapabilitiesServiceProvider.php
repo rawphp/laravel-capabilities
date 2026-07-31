@@ -5,6 +5,12 @@ namespace Rawphp\Capabilities;
 use Illuminate\Support\ServiceProvider;
 use Rawphp\Capabilities\Adapters\Artisan\ArtisanCommandRegistrar;
 use Rawphp\Capabilities\Adapters\Artisan\ArtisanCommandTable;
+use Rawphp\Capabilities\Adapters\Http\ApprovalController;
+use Rawphp\Capabilities\Adapters\Http\AuthController;
+use Rawphp\Capabilities\Adapters\Http\CapabilityController;
+use Rawphp\Capabilities\Adapters\Http\IlluminateApprovalController;
+use Rawphp\Capabilities\Adapters\Http\IlluminateAuthController;
+use Rawphp\Capabilities\Adapters\Http\IlluminateCapabilityController;
 use Rawphp\Capabilities\Adapters\JobSurface;
 use Rawphp\Capabilities\Adapters\PeerVersionProbe;
 use Rawphp\Capabilities\Approval\ApprovalManager;
@@ -14,12 +20,17 @@ use Rawphp\Capabilities\Boot\CapabilitiesConfig;
 use Rawphp\Capabilities\Boot\ContainerBindings;
 use Rawphp\Capabilities\Boot\RegistrationPlan;
 use Rawphp\Capabilities\Boot\SurfaceNames;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Rawphp\Capabilities\Contracts\AuthTokenIssuer;
 use Rawphp\Capabilities\Contracts\CapabilityBus;
 use Rawphp\Capabilities\Contracts\IdempotencyStore;
 use Rawphp\Capabilities\Contracts\Metrics;
+use Rawphp\Capabilities\Contracts\RateLimitCache;
+use Rawphp\Capabilities\Contracts\RateLimiter;
 use Rawphp\Capabilities\Contracts\ScopeResolver;
 use Rawphp\Capabilities\Contracts\Tracer;
 use Rawphp\Capabilities\Discovery\CapabilityDiscoveryBoot;
+use Rawphp\Capabilities\Http\HttpAuthGate;
 use Rawphp\Capabilities\Http\HttpRouteRegistrar;
 use Illuminate\Database\ConnectionInterface;
 use Rawphp\Capabilities\Observability\InMemoryTracer;
@@ -27,6 +38,7 @@ use Rawphp\Capabilities\Observability\LogFallbackMetrics;
 use Rawphp\Capabilities\Persistence\TableGateway;
 use Rawphp\Capabilities\Registry\CapabilityRegistry;
 use Rawphp\Capabilities\Support\DefaultScopeResolver;
+use Rawphp\Capabilities\Support\IlluminateRateLimitCache;
 
 /**
  * Core package service provider.
@@ -108,12 +120,24 @@ class CapabilitiesServiceProvider extends ServiceProvider
         });
         $this->app->alias(ApprovalManager::class, 'ApprovalManager');
 
+        $this->app->singleton(RateLimiter::class, function ($app) {
+            $config = self::configFromApp($app);
+
+            return ContainerBindings::makeRateLimiter(
+                $config,
+                self::boundRateLimitCacheOrNull($app),
+            );
+        });
+        $this->app->alias(RateLimiter::class, 'RateLimiter');
+
         $this->app->singleton(CapabilityRegistry::class, function ($app) {
             $config = self::configFromApp($app);
             /** @var ApprovalManager $approval */
             $approval = $app->make(ApprovalManager::class);
             /** @var IdempotencyStore $idempotency */
             $idempotency = $app->make(IdempotencyStore::class);
+            /** @var RateLimiter $rateLimiter */
+            $rateLimiter = $app->make(RateLimiter::class);
 
             return ContainerBindings::makeRegistry(
                 $config,
@@ -121,12 +145,76 @@ class CapabilitiesServiceProvider extends ServiceProvider
                 $approval->store(),
                 $idempotency,
                 self::boundConnectionOrNull($app, $config, null),
+                self::boundRateLimitCacheOrNull($app),
+                $rateLimiter,
             );
         });
         $this->app->alias(CapabilityRegistry::class, 'CapabilityRegistry');
         // CapabilityController type-hints CapabilityBus — same singleton, no second registry (REQ-057).
         $this->app->alias(CapabilityRegistry::class, CapabilityBus::class);
         $this->app->alias(CapabilityRegistry::class, 'CapabilityBus');
+
+        // HTTP controllers + Illuminate edge wrappers (L-001 / REQ-071).
+        // Pure controllers stay unit-testable; wrappers accept Request / return JsonResponse.
+        $this->app->singleton(CapabilityController::class, function ($app) {
+            $config = self::configFromApp($app);
+            $http = is_array($config['surfaces']['http'] ?? null) ? $config['surfaces']['http'] : [];
+            $clients = is_array($config['clients'] ?? null) ? $config['clients'] : [];
+
+            return new CapabilityController(
+                $app->make(CapabilityBus::class),
+                $clients,
+                $http,
+                new HttpAuthGate(['health_public' => (bool) ($http['health_public'] ?? false)]),
+            );
+        });
+
+        $this->app->singleton(AuthController::class, function ($app) {
+            $config = self::configFromApp($app);
+            $http = is_array($config['surfaces']['http'] ?? null) ? $config['surfaces']['http'] : [];
+            $cli = is_array($config['surfaces']['cli'] ?? null) ? $config['surfaces']['cli'] : [];
+
+            return new AuthController($http, $cli, self::boundAuthTokenIssuerOrNull($app));
+        });
+
+        $this->app->singleton(ApprovalController::class, function ($app) {
+            $config = self::configFromApp($app);
+            $http = is_array($config['surfaces']['http'] ?? null) ? $config['surfaces']['http'] : [];
+
+            return new ApprovalController(
+                $app->make(ApprovalManager::class),
+                $http,
+                new HttpAuthGate(['health_public' => (bool) ($http['health_public'] ?? false)]),
+            );
+        });
+
+        $this->app->singleton(IlluminateCapabilityController::class, static fn ($app) => new IlluminateCapabilityController(
+            $app->make(CapabilityController::class),
+        ));
+        $this->app->singleton(IlluminateAuthController::class, static fn ($app) => new IlluminateAuthController(
+            $app->make(AuthController::class),
+        ));
+        $this->app->singleton(IlluminateApprovalController::class, static fn ($app) => new IlluminateApprovalController(
+            $app->make(ApprovalController::class),
+        ));
+    }
+
+    /**
+     * Host-bound AuthTokenIssuer for CLI/API token issuance (L-002).
+     * Unbound → AuthController fails closed with not_configured.
+     */
+    private static function boundAuthTokenIssuerOrNull(object $app): ?AuthTokenIssuer
+    {
+        try {
+            if (method_exists($app, 'bound') && ! $app->bound(AuthTokenIssuer::class)) {
+                return null;
+            }
+            $issuer = $app->make(AuthTokenIssuer::class);
+
+            return $issuer instanceof AuthTokenIssuer ? $issuer : null;
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -145,6 +233,48 @@ class CapabilitiesServiceProvider extends ServiceProvider
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    /**
+     * Shared cache for rate_limits.driver=cache (L-008).
+     *
+     * Order: bound RateLimitCache → cache.store / Cache Repository → null (fail closed in factory).
+     */
+    private static function boundRateLimitCacheOrNull(object $app): ?RateLimitCache
+    {
+        try {
+            if (method_exists($app, 'bound') && $app->bound(RateLimitCache::class)) {
+                $custom = $app->make(RateLimitCache::class);
+
+                return $custom instanceof RateLimitCache ? $custom : null;
+            }
+        } catch (\Throwable) {
+            // fall through to Illuminate cache
+        }
+
+        try {
+            if (method_exists($app, 'bound') && $app->bound('cache.store')) {
+                $repo = $app->make('cache.store');
+                if ($repo instanceof CacheRepository) {
+                    return new IlluminateRateLimitCache($repo);
+                }
+            }
+        } catch (\Throwable) {
+            // try Repository class binding
+        }
+
+        try {
+            if (method_exists($app, 'bound') && $app->bound(CacheRepository::class)) {
+                $repo = $app->make(CacheRepository::class);
+                if ($repo instanceof CacheRepository) {
+                    return new IlluminateRateLimitCache($repo);
+                }
+            }
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return null;
     }
 
     /**

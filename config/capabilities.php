@@ -128,14 +128,16 @@ return [
     |
     | driver: memory | in_memory | array | database | db | eloquent
     | connection: optional Illuminate connection name when driver=database.
-    | Package default is memory; host apps enable database for durable keys.
+    | Package default is database — aligned with approval.store so multi-worker
+    | mutating invokes honor Idempotency-Key durably (L-009 / REQ-070 / D-005).
+    | Use memory only for single-process unit tests / local throwaway installs.
     | Dual-table: database path uses capabilities_idempotency (not approvals).
     |
     */
     'idempotency' => [
         'enabled' => true,
-        // Package default is memory; host apps may rebind a database driver.
-        'driver' => $env('CAPABILITIES_IDEMPOTENCY_DRIVER', 'memory'),
+        // Aligned with approval.store=database (L-009 / REQ-070).
+        'driver' => $env('CAPABILITIES_IDEMPOTENCY_DRIVER', 'database'),
         'connection' => $env('CAPABILITIES_IDEMPOTENCY_CONNECTION', null),
         'ttl_hours' => 24,
         'header' => 'Idempotency-Key',
@@ -146,8 +148,25 @@ return [
         'validate_output' => true,
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Rate limits (D-013 / L-008)
+    |--------------------------------------------------------------------------
+    |
+    | driver: memory | cache
+    |   memory — process-local InMemoryRateLimiter (unit tests / single worker only)
+    |   cache  — LaravelCacheRateLimiter over shared Illuminate cache (Redis, etc.)
+    |
+    | Package default is cache so multi-worker FPM/queue hosts share counters.
+    | Unit tests must pass rate_limits.driver=memory or inject RateLimitCache
+    | (ArrayRateLimitCache). Production multi-worker MUST keep driver=cache and
+    | ensure the app cache store is shared (typically redis) — memory gives a
+    | false sense of protection under scale-out.
+    |
+    */
     'rate_limits' => [
         'enabled' => true,
+        'driver' => $env('CAPABILITIES_RATE_LIMITS_DRIVER', 'cache'),
         'defaults' => [
             'per_minute' => 60,
             'per_capability_per_minute' => 30,

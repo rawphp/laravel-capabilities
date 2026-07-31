@@ -66,6 +66,9 @@ final class CapabilityRegistry implements CapabilityBus
     /** @var array<string, string> alias => canonical name */
     private array $aliases = [];
 
+    /** @var array<string, string> "domain\\0verb" => canonical capability name (CLI-002) */
+    private array $cliRoutes = [];
+
     /** @var list<object> */
     private array $failedEvents = [];
 
@@ -242,7 +245,10 @@ final class CapabilityRegistry implements CapabilityBus
         $this->scopeResolver = $scopeResolver;
         $this->resolveTenant = new ResolveTenantFromCaller($scopeResolver);
         $this->idempotencyGuard = new IdempotencyGuard($idempotencyStore);
-        $this->authorizer = $authorizer ?? StubAuthorizer::allow();
+        // Fail closed (L-003 / REQ-070): no per-capability authorize and no host
+        // authorizer → deny. Tests and hosts must pass StubAuthorizer::allow() or
+        // withAuthorizer(...) / a capability authorize callable explicitly.
+        $this->authorizer = $authorizer ?? StubAuthorizer::deny();
         $this->rateLimiter = $rateLimiter ?? new InMemoryRateLimiter;
         $this->approvalStore = $approvalStore;
         $this->auditWriter = $auditWriter;
@@ -290,11 +296,47 @@ final class CapabilityRegistry implements CapabilityBus
             }
         }
 
+        $this->assertUniqueCliPair($definition);
+
         $this->definitions[$definition->name] = $definition;
 
         foreach ($definition->aliases as $alias) {
             $this->aliases[$alias] = $definition->name;
         }
+
+        if ($definition->cliDomain !== null && $definition->cliVerb !== null) {
+            $this->cliRoutes[$this->cliRouteKey($definition->cliDomain, $definition->cliVerb)] = $definition->name;
+        }
+    }
+
+    /**
+     * Reject two definitions claiming the same CLI (domain, verb) pair (server authoritative).
+     *
+     * @throws InvalidArgumentException
+     */
+    private function assertUniqueCliPair(CapabilityDefinition $definition): void
+    {
+        if ($definition->cliDomain === null || $definition->cliVerb === null) {
+            return;
+        }
+
+        $key = $this->cliRouteKey($definition->cliDomain, $definition->cliVerb);
+        if (! isset($this->cliRoutes[$key])) {
+            return;
+        }
+
+        throw new InvalidArgumentException(sprintf(
+            'Duplicate CLI routing pair (domain="%s", verb="%s"): capability "%s" collides with already-registered "%s".',
+            $definition->cliDomain,
+            $definition->cliVerb,
+            $definition->name,
+            $this->cliRoutes[$key],
+        ));
+    }
+
+    private function cliRouteKey(string $domain, string $verb): string
+    {
+        return $domain."\0".$verb;
     }
 
     /**
@@ -571,6 +613,11 @@ final class CapabilityRegistry implements CapabilityBus
         $this->rateLimiter = $limiter;
 
         return $this;
+    }
+
+    public function rateLimiter(): RateLimiter
+    {
+        return $this->rateLimiter;
     }
 
     public function withScopeResolver(ScopeResolver $resolver): self

@@ -66,8 +66,11 @@ it('memory drivers construct in-memory stores and approval manager', function ()
 });
 
 it('registry factory returns a shared empty map instance shape for discovery/fluent', function () {
-    $config = CapabilitiesConfig::defaults();
-    // defaults use approval.store=database — unit path injects ArrayTableGateway (REQ-051)
+    // Package defaults: approval.store=database, rate_limits.driver=cache.
+    // Unit path: ArrayTableGateway + memory rate limiter (REQ-051 / L-008).
+    $config = array_replace_recursive(CapabilitiesConfig::defaults(), [
+        'rate_limits' => ['driver' => 'memory'],
+    ]);
     $gw = new ArrayTableGateway;
     $a = ContainerBindings::makeRegistry($config, $gw);
     $b = ContainerBindings::makeRegistry($config, $gw);
@@ -169,7 +172,11 @@ it('makeRegistry applies globally enabled surfaces from surfaces.*.enabled', fun
 });
 
 it('makeRegistry injects approval store matching makeApprovalManager driver', function () {
-    $memory = BootHelpers::config(['approval' => ['store' => 'memory']]);
+    // Pair memory approval with memory idempotency — package default idempotency is now database (REQ-070).
+    $memory = BootHelpers::config([
+        'approval' => ['store' => 'memory'],
+        'idempotency' => ['driver' => 'memory'],
+    ]);
     $database = BootHelpers::config(['approval' => ['store' => 'database']]);
     $gw = new ArrayTableGateway;
 
@@ -221,8 +228,11 @@ it('makeRegistry applies audit mode/enabled/required/driver via registry APIs', 
 });
 
 it('makeRegistry injects DefaultScopeResolver', function () {
+    $config = array_replace_recursive(CapabilitiesConfig::defaults(), [
+        'rate_limits' => ['driver' => 'memory'],
+    ]);
     $registry = ContainerBindings::makeRegistry(
-        CapabilitiesConfig::defaults(),
+        $config,
         new ArrayTableGateway,
     );
 
@@ -422,10 +432,11 @@ it('provider register applies config-driven factories against a fake app', funct
 
     $provider->register();
 
-    // Unit path: force memory approval so SP does not require a DB connection (REQ-051).
+    // Unit path: force memory drivers so SP does not require DB/cache (REQ-051 / L-008).
     $merged = $app->make('config')->get('capabilities', []);
     $merged['approval']['store'] = 'memory';
     $merged['idempotency']['driver'] = 'memory';
+    $merged['rate_limits']['driver'] = 'memory';
     $app->make('config')->set('capabilities', $merged);
 
     $registry = $app->make(CapabilityRegistry::class);
