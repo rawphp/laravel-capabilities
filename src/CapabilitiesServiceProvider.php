@@ -2,6 +2,8 @@
 
 namespace Rawphp\Capabilities;
 
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Illuminate\Database\ConnectionInterface;
 use Illuminate\Support\ServiceProvider;
 use Rawphp\Capabilities\Adapters\Artisan\ArtisanCommandRegistrar;
 use Rawphp\Capabilities\Adapters\Artisan\ArtisanCommandTable;
@@ -12,6 +14,9 @@ use Rawphp\Capabilities\Adapters\Http\IlluminateApprovalController;
 use Rawphp\Capabilities\Adapters\Http\IlluminateAuthController;
 use Rawphp\Capabilities\Adapters\Http\IlluminateCapabilityController;
 use Rawphp\Capabilities\Adapters\JobSurface;
+use Rawphp\Capabilities\Adapters\Mcp\McpAuthProfileResolver;
+use Rawphp\Capabilities\Adapters\Mcp\McpToolAdapter;
+use Rawphp\Capabilities\Adapters\Mcp\McpToolAdapterV1;
 use Rawphp\Capabilities\Adapters\PeerVersionProbe;
 use Rawphp\Capabilities\Approval\ApprovalManager;
 use Rawphp\Capabilities\Audit\AuditLogger;
@@ -20,7 +25,6 @@ use Rawphp\Capabilities\Boot\CapabilitiesConfig;
 use Rawphp\Capabilities\Boot\ContainerBindings;
 use Rawphp\Capabilities\Boot\RegistrationPlan;
 use Rawphp\Capabilities\Boot\SurfaceNames;
-use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Rawphp\Capabilities\Contracts\AuthTokenIssuer;
 use Rawphp\Capabilities\Contracts\CapabilityBus;
 use Rawphp\Capabilities\Contracts\IdempotencyStore;
@@ -32,7 +36,7 @@ use Rawphp\Capabilities\Contracts\Tracer;
 use Rawphp\Capabilities\Discovery\CapabilityDiscoveryBoot;
 use Rawphp\Capabilities\Http\HttpAuthGate;
 use Rawphp\Capabilities\Http\HttpRouteRegistrar;
-use Illuminate\Database\ConnectionInterface;
+use Rawphp\Capabilities\Http\RouteTable;
 use Rawphp\Capabilities\Observability\InMemoryTracer;
 use Rawphp\Capabilities\Observability\LogFallbackMetrics;
 use Rawphp\Capabilities\Persistence\TableGateway;
@@ -197,6 +201,34 @@ class CapabilitiesServiceProvider extends ServiceProvider
         $this->app->singleton(IlluminateApprovalController::class, static fn ($app) => new IlluminateApprovalController(
             $app->make(ApprovalController::class),
         ));
+
+        // MCP adapter bindings (ContainerBindings plan BOOT-001) — real Laravel singletons.
+        // Without these, host MCP servers resolve McpToolAdapter interface and 500 before tools exist.
+        $this->app->singleton(McpAuthProfileResolver::class, function ($app) {
+            $config = self::configFromApp($app);
+            $auth = is_array($config['surfaces']['mcp']['auth'] ?? null)
+                ? $config['surfaces']['mcp']['auth']
+                : [];
+
+            return new McpAuthProfileResolver($auth);
+        });
+
+        $this->app->singleton(McpToolAdapter::class, function ($app) {
+            $config = self::configFromApp($app);
+            $mcp = is_array($config['surfaces']['mcp'] ?? null) ? $config['surfaces']['mcp'] : [];
+            $enabled = (bool) ($mcp['enabled'] ?? false);
+            // on_incompatible=disable soft-fails peer; fail (default) requires compatible peer when surface is on.
+            $requirePeer = (string) ($mcp['on_incompatible'] ?? 'fail') !== 'disable';
+
+            return new McpToolAdapterV1(
+                registry: $app->make(CapabilityRegistry::class),
+                probe: $app->make(PeerVersionProbe::class),
+                authResolver: $app->make(McpAuthProfileResolver::class),
+                surfaceEnabled: $enabled,
+                requireCompatiblePeer: $requirePeer,
+            );
+        });
+        $this->app->alias(McpToolAdapter::class, 'McpToolAdapter');
     }
 
     /**
@@ -352,8 +384,6 @@ class CapabilitiesServiceProvider extends ServiceProvider
         }
     }
 
-
-
     /**
      * Register in-server Artisan ops commands from ArtisanCommandTable (REQ-024).
      *
@@ -401,7 +431,7 @@ class CapabilitiesServiceProvider extends ServiceProvider
     }
 
     /**
-     * Map {@see \Rawphp\Capabilities\Http\RouteTable} onto the app router when http is enabled (REQ-021 / D-009).
+     * Map {@see RouteTable} onto the app router when http is enabled (REQ-021 / D-009).
      *
      * @return list<string> registered route keys (empty when disabled or no router)
      */
@@ -530,7 +560,6 @@ class CapabilitiesServiceProvider extends ServiceProvider
     }
 
     /**
-     * @param  object  $app
      * @return array<string, mixed>
      */
     private static function configFromApp(object $app): array
