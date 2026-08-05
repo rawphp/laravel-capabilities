@@ -29,6 +29,20 @@ Empty PHP arrays that represent JSON `{}` (and empty list-shaped `[]` when the s
 - **Consumer guidance:** Prefer `CapabilityRegistry` / facade audit APIs (`withAuditWriter`, `withAuditConfig`, `throwOnAuditFailure`, `auditMode()`, …). Do **not** construct `InvokePipeline` with legacy audit kwargs or read `$pipeline->auditWriter` (etc.). In-repo only the registry builds the pipeline; sibling packages do not.
 - **Distinct from** the JsonSchema empty-object required-enforcement break above.
 
+#### Telegram recording notifier rename (`TelegramApprovalNotifier` → `RecordingTelegramApprovalNotifier`)
+
+Public class under `Approval\Notifiers\` renamed so core does not present a production Bot API type. The rename remains real; a **deprecated dual-class soft-landing** keeps the old FQCN loadable.
+
+- **Canonical (core):** `Rawphp\Capabilities\Approval\Notifiers\RecordingTelegramApprovalNotifier` — in-memory recording double only; **no** Bot API / network in core.
+- **Deprecated dual-class (soft-landing):** `Rawphp\Capabilities\Approval\Notifiers\TelegramApprovalNotifier` — empty subclass of `RecordingTelegramApprovalNotifier`, marked `@deprecated`; still recording-only (not a network client). Prefer the canonical name for new code.
+- **Production Telegram notifier:** messaging package `Rawphp\CapabilitiesMessaging\Notifiers\TelegramApprovalNotifier` (different package/namespace) — unchanged; not renamed by this soft-landing.
+- **Consumer impact:** update imports to `RecordingTelegramApprovalNotifier` for test/recording doubles; keep using the messaging package class for real channel delivery. Old core FQCN continues to autoload with deprecation guidance until a later removal.
+
+### Added
+
+- `Contracts\ApprovalGateway` — sibling-safe port (`find` / `accept` / `reject`). `ApprovalManager` implements it; container plan + service provider alias the same singleton (mirrors `CapabilityBus`).
+- README **Public surface for sibling packages** — Contracts + public DTOs allowlist (`CapabilityResult`, `CapabilityContext`, `CapabilityData`).
+
 ### Changed
 
 #### Internal extract — approval / pipeline collaborators
