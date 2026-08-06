@@ -15,8 +15,10 @@ use Rawphp\Capabilities\Adapters\Http\IlluminateAuthController;
 use Rawphp\Capabilities\Adapters\Http\IlluminateCapabilityController;
 use Rawphp\Capabilities\Adapters\JobSurface;
 use Rawphp\Capabilities\Adapters\Mcp\McpAuthProfileResolver;
+use Rawphp\Capabilities\Adapters\Mcp\McpServerRegistrar;
 use Rawphp\Capabilities\Adapters\Mcp\McpToolAdapter;
 use Rawphp\Capabilities\Adapters\Mcp\McpToolAdapterV1;
+use Rawphp\Capabilities\Adapters\PeerIncompatibleException;
 use Rawphp\Capabilities\Adapters\PeerVersionProbe;
 use Rawphp\Capabilities\Approval\ApprovalManager;
 use Rawphp\Capabilities\Audit\AuditLogger;
@@ -376,6 +378,7 @@ class CapabilitiesServiceProvider extends ServiceProvider
         $this->bootHttpRoutes();
         $this->bootCapabilityDiscovery();
         $this->bootArtisanCommands();
+        $this->bootMcpServers();
 
         if ($this->app->runningInConsole()) {
             $this->publishes([
@@ -385,6 +388,91 @@ class CapabilitiesServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__.'/../database/migrations' => database_path('migrations'),
             ], 'capabilities-migrations');
+        }
+    }
+
+    /**
+     * Plan MCP servers from surfaces.mcp.profiles and register profile tools on the adapter
+     * (ORI-790 / D-008 / D-011 / ORI-801 / ORI-803).
+     *
+     * Production boot (no $sink) builds a server plan and may call {@see McpToolAdapter::register}
+     * for each planned profile. It does **not** push definitions into laravel/mcp — there is no
+     * peer sink like {@see HttpRouteRegistrar::registerInto}. Hosts still wire peer MCP servers
+     * (e.g. Mcp::web / peer docs). Multi-profile sequential register overwrites adapter active
+     * profile/tools (last profile wins). Optional $sink is for tests/host glue only.
+     * Disabled surface, empty profiles/servers, or soft-disabled peer → plan nothing
+     * (no half-registration). PeerIncompatibleException only when the plan is non-empty
+     * and the peer is missing/incompatible with on_incompatible=fail.
+     *
+     * Pure entry for unit tests: pass $mcpConfig + $sink explicitly without a full app boot.
+     * Static {@see bootMcpServersWith()} is preferred for unit isolation.
+     *
+     * @param  array<string, mixed>|null  $mcpConfig
+     * @param  callable(array<string, mixed>): void|null  $sink  optional peer facade sink (not used in production boot)
+     * @return list<string> planned server names (empty when disabled / no profiles)
+     */
+    public function bootMcpServers(?array $mcpConfig = null, ?callable $sink = null): array
+    {
+        $config = $mcpConfig ?? (self::configFromApp($this->app)['surfaces']['mcp'] ?? []);
+        if (! is_array($config)) {
+            $config = [];
+        }
+
+        if (! (bool) ($config['enabled'] ?? true)) {
+            return [];
+        }
+
+        try {
+            /** @var McpToolAdapter $adapter */
+            $adapter = $this->app->make(McpToolAdapter::class);
+        } catch (\Throwable) {
+            return [];
+        }
+
+        try {
+            /** @var PeerVersionProbe $probe */
+            $probe = $this->app->make(PeerVersionProbe::class);
+        } catch (\Throwable) {
+            $probe = null;
+        }
+
+        return self::bootMcpServersWith($config, $adapter, $probe, $sink);
+    }
+
+    /**
+     * Unit-testable MCP plan/register entry (no Illuminate Application required).
+     *
+     * Without $sink: {@see McpServerRegistrar::register} (plan + adapter tools only — no peer mount).
+     * With $sink: {@see McpServerRegistrar::registerInto} for test/host glue that receives planned rows.
+     * Empty plan (no profiles/servers, auto_register off, surface disabled) → [] with no
+     * peer evaluation. PeerIncompatibleException is rethrown only when real servers would
+     * register and the peer is missing/incompatible under on_incompatible=fail (ORI-801).
+     *
+     * @param  array<string, mixed>  $mcpConfig
+     * @param  callable(array<string, mixed>): void|null  $sink
+     * @return list<string>
+     */
+    public static function bootMcpServersWith(
+        array $mcpConfig,
+        McpToolAdapter $adapter,
+        ?PeerVersionProbe $probe = null,
+        ?callable $sink = null,
+    ): array {
+        if (! (bool) ($mcpConfig['enabled'] ?? true)) {
+            return [];
+        }
+
+        try {
+            if ($sink !== null) {
+                return McpServerRegistrar::registerInto($mcpConfig, $adapter, $sink, $probe);
+            }
+
+            $servers = McpServerRegistrar::register($mcpConfig, $adapter, $probe);
+
+            return array_column($servers, 'name');
+        } catch (PeerIncompatibleException $e) {
+            // Fail-closed only when plan would register servers (empty plan never reaches peer eval).
+            throw $e;
         }
     }
 

@@ -38,7 +38,37 @@ Public class under `Approval\Notifiers\` renamed so core does not present a prod
 - **Production Telegram notifier:** messaging package `Rawphp\CapabilitiesMessaging\Notifiers\TelegramApprovalNotifier` (different package/namespace) — unchanged; not renamed by this soft-landing.
 - **Consumer impact:** update imports to `RecordingTelegramApprovalNotifier` for test/recording doubles; keep using the messaging package class for real channel delivery. Old core FQCN continues to autoload with deprecation guidance until a later removal.
 
+### Fixed
+
+#### MCP auto-register boot — soft-fail when nothing to register
+
+`McpServerRegistrar::plan()` evaluates the `laravel/mcp` peer only when there are servers that would actually auto-register. Empty plans short-circuit before peer evaluation, so missing/incompatible peers no longer hard-fail app boot when there is nothing to mount.
+
+- **Soft-fail (boot continues):** empty `surfaces.mcp.profiles` / `servers`, or `auto_register` false — hosts without a compatible `laravel/mcp` no longer throw on boot solely because the MCP surface is enabled.
+- **Still fail closed:** non-empty planned servers with a missing/incompatible peer and `on_incompatible=fail` (default) still throw / register nothing — no half-register of MCP tools or servers.
+- **Consumer impact (path/VCS installers):** apps that enable `surfaces.mcp` but leave profiles empty, or set `auto_register` false for manual mounts, can boot without installing `laravel/mcp`. Install a compatible peer only when you actually plan MCP servers to auto-register.
+- Does **not** claim incomplete `path_prefix` HTTP MCP server auto-mount behaviour beyond the planned server rows returned by the registrar.
+
+#### Docs — MCP auto-register residual (plan + host wire)
+
+Documentation honesty (monorepo `docs/spec.md` + package user-guide alignment): `auto_register` / `McpServerRegistrar` are **plan + adapter register**, not a shipped live `laravel/mcp` HTTP mount under `path_prefix`.
+
+- **What production boot does:** build a server plan from `profiles` / `servers`; may call `McpToolAdapter::register` so planned profile tools load on the adapter.
+- **What production boot does not do:** push planned definitions into `laravel/mcp` (no production peer sink like HTTP `registerInto`). Hosts still **wire** peer MCP routes themselves (e.g. `Mcp::web` / peer docs) or use manual `Capability::mcpTools`.
+- **Multi-profile residual:** sequential `adapter->register` overwrites adapter active profile/tools (**last profile wins**). Multi-server hosts should wire each peer server with its own tool set.
+- **Consumer impact (path/VCS installers):** enabling MCP + `auto_register` does **not** yield zero hand-wiring — planned `path_prefix` paths are metadata until the host mounts routes. No new mount feature ships in this entry; narrative only (ORI-804 / ORI-803 package docs).
+- **Not Packagist-published / not stable 1.x** — unchanged.
+
 ### Added
+
+#### MCP auto-register public surface (`McpServerRegistrar` / boot helpers)
+
+Config-driven product MCP **server plan** + adapter registration for 0.x consumers (ORI-790):
+
+- **`Adapters\Mcp\McpServerRegistrar`** — builds a plan from `surfaces.mcp` and may call `McpToolAdapter::register` for planned profiles (plan + adapter tools; not a peer HTTP mount).
+- **`CapabilitiesServiceProvider::bootMcpServers` / `bootMcpServersWith`** — boot-time entry points for the same plan/register path (`bootMcpServersWith` preferred for unit isolation).
+- **Config:** `surfaces.mcp.auto_register` (default true), `path_prefix` (default `/mcp`, plan metadata only), `servers` (plus existing `profiles` used by the plan).
+- **Consumer impact (path/VCS installers):** hosts get new public types and config keys on upgrade. Production boot still does **not** mount live `laravel/mcp` HTTP servers under `path_prefix` — integrators host-wire peer routes (e.g. `Mcp::web` / peer docs) or use manual `Capability::mcpTools`. Distinct from **Fixed** *MCP auto-register boot — soft-fail when nothing to register* (empty plan / peer short-circuit).
 
 - `Contracts\ApprovalGateway` — sibling-safe port (`find` / `accept` / `reject`). `ApprovalManager` implements it; container plan + service provider alias the same singleton (mirrors `CapabilityBus`).
 - README **Public surface for sibling packages** — Contracts + public DTOs allowlist (`CapabilityResult`, `CapabilityContext`, `CapabilityData`).
