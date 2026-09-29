@@ -27,16 +27,14 @@ interface ApprovalGateway
     /**
      * Accept a pending approval and drive exactly-once execution when applicable.
      *
-     * @param  array<string, mixed>  $options  tenant_id?, reason?, decided_via?
-     *                                         (`{channel, channel_user_id?}` — audited on
-     *                                         approval.decided; server-derived only)
+     * @param  array<string, mixed>  $options  tenant_id?, reason?
      */
     public function accept(string $id, object $approver, array $options = []): CapabilityResult;
 
     /**
      * Reject a pending approval.
      *
-     * @param  array<string, mixed>  $options  tenant_id?, decided_via? (see accept)
+     * @param  array<string, mixed>  $options
      */
     public function reject(string $id, object $approver, ?string $reason = null, array $options = []): CapabilityResult;
 }

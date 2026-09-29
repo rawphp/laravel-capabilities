@@ -2,7 +2,12 @@
 
 namespace Rawphp\Capabilities\Pipeline;
 
+use Error;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
 use InvalidArgumentException;
+use PDOException;
 use Rawphp\Capabilities\Approval\ApprovalManager;
 use Rawphp\Capabilities\Contracts\Authorizer;
 use Rawphp\Capabilities\Contracts\RateLimiter;
@@ -146,17 +151,13 @@ final class InvokePipeline
 
             $this->stageStoreIdempotency($state);
             $auditFailure = $this->stageRecordAudit($state, success: true);
+            $this->results()->emitEvents($state, success: true);
 
             // Strict audit failure after successful domain run: surface error without
             // rolling back domain-owned commits (D-010 footgun when domain already committed).
-            // Listeners see the same outcome the caller does.
             if ($auditFailure !== null) {
-                $this->results()->emitEvents($state, success: false, failure: $auditFailure);
-
                 return $this->results()->wireResponse($state, $auditFailure);
             }
-
-            $this->results()->emitEvents($state, success: true);
 
             $successMeta = [
                 'request_id' => $state->requestId,
@@ -269,8 +270,21 @@ final class InvokePipeline
             );
         }
 
+        $inputClass = $state->definition->input;
+        if ($inputClass === null) {
+            $state->input = $state->rawInput;
+
+            return null;
+        }
+
         try {
-            $state->input = $this->hydrate($state->definition, $state->rawInput);
+            if (is_a($inputClass, CapabilityData::class, true)) {
+                /** @var class-string<CapabilityData> $inputClass */
+                $state->input = $inputClass::fromArray($state->rawInput);
+            } else {
+                /** @var class-string<SchemaProvider> $inputClass */
+                $state->input = $inputClass::validate($state->rawInput);
+            }
         } catch (Throwable $e) {
             return CapabilityResult::failure(
                 code: 'validation_failed',
@@ -495,53 +509,6 @@ final class InvokePipeline
     }
 
     /**
-     * Authorize stored raw input for an actor outside a live invoke — approval
-     * accept re-checks the original requester (spec: re-validation on accept, step 4).
-     * Same decision as the authorize stage; input that no longer hydrates is denied.
-     *
-     * @param  array<string, mixed>  $rawInput
-     */
-    public function authorizes(CapabilityDefinition $definition, array $rawInput, CapabilityContext $context): bool
-    {
-        try {
-            $input = $this->hydrate($definition, $rawInput);
-        } catch (Throwable) {
-            return false;
-        }
-
-        return $this->allows($definition, $input, $context);
-    }
-
-    /**
-     * @param  array<string, mixed>  $rawInput
-     */
-    private function hydrate(CapabilityDefinition $definition, array $rawInput): mixed
-    {
-        $inputClass = $definition->input;
-        if ($inputClass === null) {
-            return $rawInput;
-        }
-
-        if (is_a($inputClass, CapabilityData::class, true)) {
-            /** @var class-string<CapabilityData> $inputClass */
-            return $inputClass::fromArray($rawInput);
-        }
-
-        /** @var class-string<SchemaProvider> $inputClass */
-        return $inputClass::validate($rawInput);
-    }
-
-    private function allows(CapabilityDefinition $definition, mixed $input, mixed $context): bool
-    {
-        $definitionAuth = $definition->authorize;
-        if (is_callable($definitionAuth)) {
-            return (bool) $definitionAuth($input, $context);
-        }
-
-        return $this->authorizer->authorize($definition->name, $input, $context);
-    }
-
-    /**
      * @param  list<string>  $forced
      */
     private function stageAuthorize(InvokeState $state, array $forced): ?CapabilityResult
@@ -555,7 +522,19 @@ final class InvokePipeline
             );
         }
 
-        if (! $this->allows($state->definition, $state->input, $state->context)) {
+        $allowed = true;
+        $definitionAuth = $state->definition->authorize;
+        if (is_callable($definitionAuth)) {
+            $allowed = (bool) $definitionAuth($state->input, $state->context);
+        } else {
+            $allowed = $this->authorizer->authorize(
+                $state->definition->name,
+                $state->input,
+                $state->context,
+            );
+        }
+
+        if (! $allowed) {
             return CapabilityResult::failure(
                 code: 'forbidden',
                 message: sprintf('Not authorized to invoke "%s".', $state->definition->name),
@@ -637,12 +616,10 @@ final class InvokePipeline
             return $this->rateLimitedResult('Forced failure at rate_limit.');
         }
 
-        // Agent turn budget (D-013) — checked whenever an in-process adapter supplies the turn's
-        // tool-call count (agent tools, AI turns as caller=job). Only ever narrows.
-        if (array_key_exists('agent_turn_tool_calls', $state->options)) {
+        // Agent turn budget (D-013) — checked when caller is agent and option is set.
+        if ($state->caller === 'agent' && array_key_exists('agent_turn_tool_calls', $state->options)) {
             $calls = (int) $state->options['agent_turn_tool_calls'];
-            $perTurn = $state->definition->rateLimit['max_tool_calls_per_turn'] ?? null;
-            $budget = $this->agentTurnBudget()->narrowedTo(is_numeric($perTurn) ? (int) $perTurn : null);
+            $budget = $this->agentTurnBudget();
             if ($budget->exhausted($calls)) {
                 $stop = $budget->stopMessage($calls);
 
@@ -761,13 +738,33 @@ final class InvokePipeline
             $this->observation->invokeStartedAt ??= microtime(true);
             $state->output = $this->executeRun($state->definition, $state->input, $state->context);
         } catch (Throwable $e) {
-            return CapabilityResult::failure(
-                code: 'domain_error',
-                message: $e->getMessage(),
-            );
+            return $this->runFailure($e);
         }
 
         return null;
+    }
+
+    /**
+     * Bug-class errors are reported and hidden; missing models are not_found;
+     * anything else is a deliberate domain throw and keeps its message (L-004).
+     */
+    private function runFailure(Throwable $e): CapabilityResult
+    {
+        if ($e instanceof ModelNotFoundException) {
+            return CapabilityResult::failure(code: 'not_found', message: 'Not found.');
+        }
+
+        // QueryException is a PDOException.
+        if ($e instanceof Error || $e instanceof PDOException) {
+            $container = Container::getInstance();
+            if ($container->bound(ExceptionHandler::class)) {
+                $container->make(ExceptionHandler::class)->report($e);
+            }
+
+            return CapabilityResult::failure(code: 'internal', message: 'Internal error.');
+        }
+
+        return CapabilityResult::failure(code: 'domain_error', message: $e->getMessage());
     }
 
     /**

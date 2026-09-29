@@ -9,47 +9,31 @@ with **0.x pre-stable** expectations (breaking changes allowed without a major b
 Monorepo packaging policy (install paths, tags, Packagist checklist):  
 https://github.com/rawphp/laravel-capabilities-monorepo/blob/main/docs/versioning.md
 
-## [Unreleased]
-
-### Changed (BREAKING)
-
-#### Accepted approvals now run the capability
-
-Before this change, an `ApprovalManager` with no executor bound — which included the
-container singleton behind the HTTP approve route and the messaging `ApprovalGateway`,
-and `CapabilityRegistry::approvals()` — marked accepted or resumed approvals `executed`
-with a fabricated `{"executed": true}` result. The capability never ran and its output
-contract was never checked.
-
-- **Default executor** — `CapabilityRegistry::executeApproval($row)` re-invokes the
-  stored capability through the registry pipeline as the original requester (user id +
-  tenant, or the same `SystemActor`) and caller: re-validate, re-scope, authorize, run
-  once, output contract. The container `ApprovalManager` and `registry->approvals()`
-  use it by default.
-- **Fail closed** — a manager with no executor now records `executed` + `failed` with
-  `not_configured` instead of reporting success.
-- **Host note** — the requester is rebuilt as a plain principal (`id`, `tenant_id`). If
-  your authorizer needs a real user model, bind your own with
-  `ApprovalManager::withExecutor(...)`.
-
-#### MCP integration clients are bound to configured profiles (D-023)
-
-An `integration` MCP principal could previously run inside any profile the host
-passed. It now runs only inside profiles listed for its `client_id` under
-`surfaces.mcp.auth.integration_profiles` (`client_id => list<profile>`). Any other
-profile — or no profile — returns `forbidden` with `normalized_code`
-`integration_profile_forbidden`, before the registry is invoked. User principals
-(`user_pat`, `user_delegated`) are unchanged.
-
-**Upgrade:** add an `integration_profiles` entry for every client in
-`integration_actors`, or its tool calls will be refused.
+## [0.5.3] - 2026-09-29
 
 ### Changed
 
-- **Discovery fails closed on half-written capability classes (D-017).** A class carrying
-  `#[Capability]` that does not implement `DefinesCapability` now throws `BootException`
-  during discovery instead of being silently dropped from the catalog. Add
-  `implements DefinesCapability` or remove the attribute.
+#### InvokePipeline run stage — bug-class errors no longer look like domain errors
+
+Before this release every throwable from a capability's run stage became 422
+`domain_error` (cli_exit 5, retryable false) with the exception message passed
+through, so PHP bugs and SQL errors reached callers as "domain" failures and
+leaked SQL text and model class names. The run-stage catch now maps:
+
+- **`\Error` (incl. `TypeError`) and `PDOException` (incl. `QueryException`)** →
+  `internal`, HTTP 500, cli_exit 1, retryable true, message `Internal error.`.
+  The exception is reported through the bound `ExceptionHandler`.
+- **`ModelNotFoundException`** → `not_found`, HTTP 404, cli_exit 5, retryable false,
+  message `Not found.`. Not reported.
+- **Everything else** (other `RuntimeException` / `Exception` throws) → unchanged:
+  422 `domain_error` with its message.
+
+The `capabilities_invoke_total` status label follows the new codes.
+
+Consumers: clients or middleware that matched 422 plus "No query results for model"
+or SQL text must switch to 404/`not_found` and 500/`internal`. A run-stage `internal`
+failure under an Idempotency-Key is stored and replayed for the key's TTL like any other
+failure, so a retry of a transient error needs a new key.
 
 ## [0.5.2] - 2026-08-27
 
@@ -85,10 +69,6 @@ Consumers: `composer update rawphp/laravel-capabilities && php artisan migrate`.
   `confirmation_failed` (422), `last_super_admin` (409) for platform-admin AdminError mapping.
 
 ## [Unreleased]
-
-### Fixed
-
-- **Agent turn budget (D-013) is no longer agent-caller only:** the pipeline enforces `rate_limits.agent_turn.max_tool_calls` whenever an in-process adapter supplies `agent_turn_tool_calls`, whatever the caller. AI turns (`caller=job` from `rawphp/laravel-capabilities-ai`) are now capped. The option is never read from HTTP or tool input, and it can only deny.
 
 ### Breaking (0.x behavior change)
 
@@ -139,14 +119,6 @@ Documentation honesty (monorepo `docs/spec.md` + package user-guide alignment): 
 - **Not Packagist-published / not stable 1.x** — unchanged.
 
 ### Added
-
-#### Audit entry `tool_profile` (D-008 / D-010)
-
-Every audit entry now carries `tool_profile`: the tool profile the surface gated the invoke under.
-`runCapabilityInProfile()` stamps the **enforced** profile (overwriting any caller-supplied
-`tool_profile` option), so agent and MCP adapter invokes record it; sibling surfaces that gate
-tools themselves (messaging) pass it as an invoke option. `null` for invokes outside a profile
-(HTTP, CLI, job).
 
 #### Host integration diagnostics + MCP fail policy (UR-062 / D-024)
 

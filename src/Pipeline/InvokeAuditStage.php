@@ -32,16 +32,12 @@ final class InvokeAuditStage
      * Write audit entry. On success-path audit failure:
      * - best_effort: log (+ outbox when required); return null so client still succeeds
      * - strict: return failure envelope; domain run is NOT rolled back by the registry
-     *
-     * $force bypasses the capability's own audit opt-out (readOnly / audit: false) so a
-     * server bug like output_invalid is never silently dropped; a failed write then always
-     * lands in the outbox. The global audit.enabled switch still wins.
      */
-    public function record(InvokeState $state, bool $success, ?CapabilityResult $failure = null, bool $force = false): ?CapabilityResult
+    public function record(InvokeState $state, bool $success, ?CapabilityResult $failure = null): ?CapabilityResult
     {
         $state->mark(PipelineStages::RECORD_AUDIT);
 
-        if (! $this->auditEnabled || $this->auditWriter === null || ! $state->definition->shouldAudit($force)) {
+        if (! $this->auditEnabled || $this->auditWriter === null || ! $state->definition->shouldAudit()) {
             return null;
         }
 
@@ -91,8 +87,8 @@ final class InvokeAuditStage
                 'context' => ['capability' => $state->definition->name],
             ];
 
-            // best_effort + required (or forced): never silent drop — durable outbox intent.
-            if ($this->auditRequired || $force) {
+            // best_effort + required: never silent drop — durable outbox intent.
+            if ($this->auditRequired) {
                 $this->ensureOutbox()->enqueue($entry);
             } elseif ($this->auditRequired === false) {
                 // optional retry path may still enqueue when outbox is bound
