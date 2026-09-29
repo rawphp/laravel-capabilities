@@ -19,6 +19,9 @@ final class AuditLogger
     /** @var list<string> */
     public const SUPPORTED_MODES = ['best_effort', 'strict'];
 
+    /** @var list<string> Matched as substrings of the normalized key. */
+    private const SENSITIVE_KEYS = ['password', 'secret', 'token', 'apikey', 'authorization'];
+
     /**
      * @return array<string, mixed>
      */
@@ -34,7 +37,7 @@ final class AuditLogger
         $redacted = self::redactInput($state);
 
         return [
-            'event' => $success ? 'capability.invoked' : 'capability.failed',
+            'event' => self::event($success, $failure),
             'name' => $state->definition->name,
             'capability_name' => $state->definition->name,
             'caller' => $state->caller,
@@ -75,8 +78,26 @@ final class AuditLogger
             ],
             'request_id' => $state->requestId,
             // D-023: MCP auth profile + client_id on every MCP invoke when present.
-            'mcp' => $ctx?->mcp(),
+            // Host-supplied metadata goes through the same sieve as input.
+            'mcp' => self::redactNullable($ctx?->mcp()),
+            // D-008: tool profile the surface gated this invoke under; null outside a profile.
+            'tool_profile' => $state->options['tool_profile'] ?? null,
+            // Messaging ingress metadata (channel, chat_id, user_link_id) when present.
+            'messaging' => self::redactNullable($ctx?->messaging()),
         ];
+    }
+
+    /**
+     * output_invalid is a server bug (D-014), so it gets its own tag rather than
+     * hiding among ordinary capability.failed entries.
+     */
+    private static function event(bool $success, ?CapabilityResult $failure): string
+    {
+        if ($success) {
+            return 'capability.invoked';
+        }
+
+        return $failure?->errorCode() === 'output_invalid' ? 'capability.output_invalid' : 'capability.failed';
     }
 
     public static function assertValidMode(string $mode): string
@@ -105,7 +126,7 @@ final class AuditLogger
     }
 
     /**
-     * @return array<string, mixed>|list<mixed>|null
+     * @return array<array-key, mixed>|null
      */
     private static function redactInput(InvokeState $state): ?array
     {
@@ -117,31 +138,73 @@ final class AuditLogger
             return null;
         }
 
-        $redacted = $raw;
-        foreach (['password', 'secret', 'token', 'api_key', 'authorization'] as $sensitive) {
-            if (array_key_exists($sensitive, $redacted)) {
-                $redacted[$sensitive] = '[REDACTED]';
+        return self::redact($raw, $state->definition->inputSchema() ?? []);
+    }
+
+    /**
+     * @param  array<array-key, mixed>|null  $data
+     * @return array<array-key, mixed>|null
+     */
+    private static function redactNullable(?array $data): ?array
+    {
+        return $data === null ? null : self::redact($data);
+    }
+
+    /**
+     * Recursively redacts values whose key contains a sensitive word, ignoring case
+     * and separators (Authorization, user_password, apiKey, Access-Token), and values
+     * the input schema marks `writeOnly` (#[Field(sensitive: true)]), including nested
+     * objects and array items.
+     *
+     * @param  array<array-key, mixed>  $data
+     * @param  array<array-key, mixed>  $schema
+     * @return array<array-key, mixed>
+     */
+    private static function redact(array $data, array $schema = []): array
+    {
+        $properties = is_array($schema['properties'] ?? null) ? $schema['properties'] : [];
+        $items = is_array($schema['items'] ?? null) ? $schema['items'] : null;
+
+        foreach ($data as $key => $value) {
+            $fieldSchema = $items ?? (is_array($properties[$key] ?? null) ? $properties[$key] : []);
+
+            if (self::isSensitiveKey((string) $key) || ($fieldSchema['writeOnly'] ?? false) === true) {
+                $data[$key] = '[REDACTED]';
+
+                continue;
+            }
+
+            if (is_array($value)) {
+                $data[$key] = self::redact($value, $fieldSchema);
             }
         }
 
-        return $redacted;
+        return $data;
+    }
+
+    private static function isSensitiveKey(string $key): bool
+    {
+        $normalized = str_replace(['_', '-', '.', ' '], '', strtolower($key));
+        foreach (self::SENSITIVE_KEYS as $sensitive) {
+            if (str_contains($normalized, $sensitive)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static function resultSummary(mixed $output): mixed
     {
-        if ($output instanceof CapabilityData) {
-            return $output->toArray();
-        }
-
         if (is_object($output) && method_exists($output, 'toArray')) {
-            return $output->toArray();
-        }
-
-        if (is_scalar($output) || $output === null) {
-            return $output;
+            $output = $output->toArray();
         }
 
         if (is_array($output)) {
+            return self::redact($output);
+        }
+
+        if (is_scalar($output) || $output === null) {
             return $output;
         }
 
